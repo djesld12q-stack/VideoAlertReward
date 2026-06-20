@@ -1,0 +1,1246 @@
+<!DOCTYPE html>
+<html lang="uk">
+<head>
+    <meta charset="UTF-8">
+    <title>Video Alert Overlay</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        body {
+            width: 1920px;
+            height: 1080px;
+            background: transparent;
+            overflow: hidden;
+            font-family: Arial, sans-serif;
+        }
+
+        #overlay {
+            position: fixed;
+            inset: 0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            pointer-events: none;
+            z-index: 10;
+        }
+
+        /* ── Відео-обгортка — керує позицією ── */
+        #videoWrap {
+            position: absolute;
+            /* Завжди в DOM, прихований через opacity+visibility */
+            visibility: hidden;
+            opacity: 0;
+            transition: opacity 0.4s ease, visibility 0s linear 0.4s;
+            /* Позиція і розмір задаються через JS inline style */
+        }
+        #videoWrap.visible {
+            visibility: visible;
+            opacity: 1;
+            transition: opacity 0.4s ease, visibility 0s linear 0s;
+        }
+        #videoWrap.fading {
+            opacity: 0;
+            visibility: hidden;
+            transition: opacity 0.4s ease, visibility 0s linear 0.4s;
+        }
+
+        #alertVideo {
+            width: 100%;
+            height: 100%;
+            object-fit: contain;
+            display: block;
+        }
+
+        #timer {
+            position: absolute;
+            bottom: 30px;
+            right: 30px;
+            font-size: 3em;
+            font-weight: 900;
+            color: #fff;
+            text-shadow: 0 0 20px rgba(0,0,0,0.9), 0 2px 8px rgba(0,0,0,0.8);
+            background: rgba(0,0,0,0.55);
+            padding: 14px 24px;
+            border-radius: 12px;
+            min-width: 80px;
+            text-align: center;
+            display: none;
+            opacity: 0;
+            transition: opacity 0.4s ease;
+        }
+
+        #timer.visible {
+            display: block;
+            opacity: 1;
+        }
+
+        #timer.fading {
+            opacity: 0;
+        }
+
+        #debug {
+            position: fixed;
+            top: 10px;
+            left: 10px;
+            background: rgba(0,0,0,0.75);
+            color: #0f0;
+            font-family: monospace;
+            font-size: 11px;
+            padding: 8px 12px;
+            border-radius: 6px;
+            max-width: 360px;
+            z-index: 9999;
+            max-height: 260px;
+            overflow-y: auto;
+            line-height: 1.5;
+            transition: opacity 1s ease;
+        }
+        #debug.hiding { opacity: 0; pointer-events: none; }
+        #debug.hidden { display: none; }
+
+        .debug-status {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            margin-bottom: 4px;
+        }
+
+        .dot {
+            width: 8px; height: 8px;
+            border-radius: 50%;
+            background: #f00;
+            flex-shrink: 0;
+            animation: blink 1s infinite;
+        }
+
+        .dot.on {
+            background: #0f0;
+            animation: none;
+        }
+
+        .dot.synced {
+            background: #6af;
+            animation: none;
+        }
+
+        @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0.3} }
+
+        #userName {
+            position: absolute;
+            bottom: 40px;
+            left: 50%;
+            transform: translateX(-50%);
+            background: rgba(0,0,0,0.72);
+            color: #fff;
+            font-size: 1.8em;
+            font-weight: 800;
+            padding: 10px 32px;
+            border-radius: 14px;
+            white-space: nowrap;
+            letter-spacing: 0.5px;
+            text-shadow: 0 2px 8px rgba(0,0,0,0.8);
+            border: 2px solid rgba(255,255,255,0.15);
+            display: none;
+            opacity: 0;
+            transition: opacity 0.4s ease;
+            pointer-events: none;
+            z-index: 20;
+        }
+        #userName.visible {
+            display: block;
+            opacity: 1;
+        }
+        #userName.fading {
+            opacity: 0;
+        }
+    </style>
+</head>
+<body>
+
+<div id="overlay">
+    <div id="videoWrap">
+        <video id="alertVideo" playsinline></video>
+    </div>
+    <audio id="alertAudio" style="display:none"></audio>
+    <div id="timer">5</div>
+    <div id="userName"></div>
+</div>
+
+<div id="debug">
+    <div class="debug-status">
+        <div class="dot" id="dot"></div>
+        <span id="connText">Підключення...</span>
+    </div>
+    <div class="debug-status" style="margin-bottom:0">
+        <div class="dot synced" id="configDot" style="background:#555;animation:blink 1s infinite"></div>
+        <span id="configText">Конфіг: очікування...</span>
+    </div>
+    <div id="log"></div>
+    <div style="margin-top:6px;border-top:1px solid #333;padding-top:6px">
+        <button onclick="runLocalTest()" style="background:#1a3a1a;color:#5be58b;border:1px solid #2a5a2a;border-radius:4px;padding:3px 8px;font-size:10px;cursor:pointer;font-family:monospace">▶ Тест з кешу</button>
+        <button onclick="document.getElementById('debug').style.display='none'" style="background:#3a1a1a;color:#f55;border:1px solid #5a2a2a;border-radius:4px;padding:3px 8px;font-size:10px;cursor:pointer;font-family:monospace;margin-left:4px">✕ Сховати</button>
+    </div>
+</div>
+
+<script>
+// =====================================================================
+// CONFIG
+// =====================================================================
+const WS_URL       = 'ws://127.0.0.1:8080/';
+const HTTP_URL     = 'http://127.0.0.1:7474';
+const RECONNECT_MS = 4000;
+
+// Версія overlay — синхронізована з APP_VERSION в index.html.
+// Оновлюється автоматично через C# Action "UpdateAppFiles" разом з файлом.
+const APP_VERSION  = '1.0.0';
+
+// =====================================================================
+// ВБУДОВАНИЙ КОНФІГ АЛЕРТІВ
+// Оновлюється динамічно через WS ConfigUpdate — файл не потрібно перезаписувати.
+// Слугує як початковий fallback при першому запуску.
+// =====================================================================
+const EMBEDDED_ALERTS = /*ALERTS_JSON*/[{"id":1781335394428,"name":"GreenDog","url":"https://github.com/djesld12q-stack/VideoAlertReward/raw/refs/heads/main/32e99075-56a0-4c36-98d7-33391e861b13.mp4","duration":11,"rewardId":"093ae4dd-87ef-48e1-83d5-aa3577148641","rewardName":"Custom: 093ae4dd-87ef-48e1-83d5-aa3577148641","chromakey":true,"showTimer":false,"obsScene":"ВІДЖЕТИ","obsSource":"Нагородитвіч","obsFilter":"Хромакей","createdAt":"2026-06-13T07:23:14.428Z","mediaType":"video","posX":260,"posY":0,"posW":1800,"posH":1000,"posAnchor":"TL","positionPreset":"bottom-center","videoScale":100,"cooldown":15,"volume":45},{"id":1781338338589,"name":"Ха","url":"https://github.com/djesld12q-stack/VideoAlertReward/raw/refs/heads/main/ff193c45-5907-4a97-a0e1-908ed8f2b2a6.mp4","duration":6,"rewardId":"b18bc958-d456-47a9-99b4-1a29c615fc4d","rewardName":"Custom: b18bc958-d456-47a9-99b4-1a29c615fc4d","chromakey":false,"showTimer":false,"obsScene":"","obsSource":"","obsFilter":"Chroma Key","createdAt":"2026-06-13T08:12:18.589Z","mediaType":"video","positionPreset":"center","videoScale":40,"cooldown":10,"volume":20},{"id":1781338532863,"name":"Їсти час !","url":"https://github.com/djesld12q-stack/VideoAlertReward/raw/refs/heads/main/fe8dc5f0-3917-49d3-a213-3c9c5872fc4d.mp4","duration":15,"rewardId":"3bddd8c8-6a0e-4f96-a724-c71f10eae5be","rewardName":"Custom: 3bddd8c8-6a0e-4f96-a724-c71f10eae5be","chromakey":true,"showTimer":false,"obsScene":"ВІДЖЕТИ","obsSource":"Нагородитвіч","obsFilter":"ФільтрЧорний","createdAt":"2026-06-13T08:15:32.863Z","mediaType":"video","positionPreset":"bottom-right","videoScale":55,"cooldown":20,"volume":35},{"id":1781338845757,"name":"Дуже гарячий","url":"https://github.com/djesld12q-stack/VideoAlertReward/raw/refs/heads/main/fe687bf0-cc1b-4b61-9488-6d504d67d5a6.mp4","duration":6,"rewardId":"d526057c-8d8d-4aae-b6cc-d18c9100e7f6","rewardName":"Custom: d526057c-8d8d-4aae-b6cc-d18c9100e7f6","chromakey":false,"showTimer":false,"obsScene":"","obsSource":"","obsFilter":"Chroma Key","createdAt":"2026-06-13T08:20:45.757Z","mediaType":"video","positionPreset":"top-center","videoScale":70,"cooldown":10,"volume":95},{"id":1781339861853,"name":"Ви мольфарка?","url":"https://github.com/djesld12q-stack/VideoAlertReward/raw/refs/heads/main/galaaudio","duration":22,"rewardId":"c1d355e6-2588-4afd-af8e-e58bdba83505","rewardName":"Custom: c1d355e6-2588-4afd-af8e-e58bdba83505","chromakey":false,"showTimer":false,"obsScene":"","obsSource":"","obsFilter":"Chroma Key","createdAt":"2026-06-13T08:37:41.853Z","mediaType":"video","positionPreset":"center","videoScale":100,"cooldown":25,"volume":70},{"id":1781346328904,"name":"big Brain","url":"https://github.com/djesld12q-stack/VideoAlertReward/raw/refs/heads/main/ffc81afd-a3c3-4ae3-ad63-f9fc0e838bc5.mp4","mediaType":"video","duration":4,"rewardId":"62862a62-305f-4e54-9ec3-8b50e2ccb841","rewardName":"Custom: 62862a62-305f-4e54-9ec3-8b50e2ccb841","chromakey":true,"showTimer":false,"obsScene":"ВІДЖЕТИ","obsSource":"Нагородитвіч","obsFilter":"ФільтрЧорний","createdAt":"2026-06-13T10:25:28.904Z","positionPreset":"center","videoScale":100,"cooldown":10,"volume":45},{"id":1781346985076,"name":"Землероб трудяга","url":"https://github.com/djesld12q-stack/VideoAlertReward/raw/refs/heads/main/5c412591-ec6c-41ec-b53d-ae9371809326.mp3","mediaType":"audio","duration":18,"rewardId":"18e00804-dfeb-464d-9779-189933bd818f","rewardName":"Custom: 18e00804-dfeb-464d-9779-189933bd818f","chromakey":false,"showTimer":false,"obsScene":"","obsSource":"","obsFilter":"Chroma Key","createdAt":"2026-06-13T10:36:25.076Z","positionPreset":"center","videoScale":100,"cooldown":20,"volume":75},{"id":1781347363800,"name":"Шо ти брешиш","url":"https://github.com/djesld12q-stack/VideoAlertReward/raw/refs/heads/main/142e15ad-2ab1-4b80-b5e3-4d307f821221.mp3","mediaType":"audio","duration":19,"rewardId":"055a1797-e8ed-48dd-ad0c-d1247e6466d4","rewardName":"Custom: 055a1797-e8ed-48dd-ad0c-d1247e6466d4","chromakey":false,"showTimer":false,"obsScene":"","obsSource":"","obsFilter":"Chroma Key","createdAt":"2026-06-13T10:42:43.800Z","positionPreset":"center","videoScale":100,"cooldown":20,"volume":75},{"id":1781347573900,"name":"Що ти дивишся","url":"https://github.com/djesld12q-stack/VideoAlertReward/raw/refs/heads/main/110d19bb-d60a-4604-8087-c25d15374175.mp3","mediaType":"audio","duration":8,"rewardId":"a701b6bb-851b-4fae-91d7-841fcf6a763b","rewardName":"Custom: a701b6bb-851b-4fae-91d7-841fcf6a763b","chromakey":false,"showTimer":false,"obsScene":"","obsSource":"","obsFilter":"Chroma Key","createdAt":"2026-06-13T10:46:13.900Z","positionPreset":"center","videoScale":100,"cooldown":10,"volume":85},{"id":1781349114211,"name":"Хто такий володя?","url":"https://github.com/djesld12q-stack/VideoAlertReward/raw/refs/heads/main/50077c24-a897-46cc-8bbf-7ee28f3f4f7e.mp3","mediaType":"audio","duration":17,"rewardId":"9db6e5d6-84c8-4bc5-b396-06df0999fb18","rewardName":"Custom: 9db6e5d6-84c8-4bc5-b396-06df0999fb18","chromakey":false,"showTimer":false,"obsScene":"","obsSource":"","obsFilter":"Chroma Key","createdAt":"2026-06-13T11:11:54.211Z","positionPreset":"center","videoScale":100,"cooldown":20,"volume":85},{"id":1781363684931,"name":"Нерви здали","url":"https://github.com/djesld12q-stack/VideoAlertReward/raw/refs/heads/main/900b1196-995e-4dec-8a66-01c09923fe90.mp3","mediaType":"audio","duration":13,"rewardId":"bdcb2f64-2d40-443a-8e41-622dfff0ef46","rewardName":"Custom: bdcb2f64-2d40-443a-8e41-622dfff0ef46","chromakey":false,"showTimer":false,"obsScene":"","obsSource":"","obsFilter":"Chroma Key","createdAt":"2026-06-13T15:14:44.931Z","positionPreset":"center","videoScale":100,"cooldown":15,"volume":70},{"id":1781363874733,"name":"WBRB","url":"https://github.com/djesld12q-stack/VideoAlertReward/raw/refs/heads/main/a62caef4-93bd-46dc-9eea-3f4da36a6544.mp4","mediaType":"video","duration":5,"rewardId":"1ffea8bd-6b44-4538-aded-1f6f165aa3a1","rewardName":"Custom: 1ffea8bd-6b44-4538-aded-1f6f165aa3a1","chromakey":true,"showTimer":false,"obsScene":"ВІДЖЕТИ","obsSource":"Нагородитвіч","obsFilter":"Хромакей","createdAt":"2026-06-13T15:17:54.733Z","positionPreset":"center","videoScale":100,"cooldown":10,"volume":80},{"id":1781364039162,"name":"Сіли поседіти та поседіли","url":"https://github.com/djesld12q-stack/VideoAlertReward/raw/refs/heads/main/b9a7a57e-89be-4abc-a951-49ef8781635d.mp3","mediaType":"audio","duration":21,"rewardId":"fe5bd765-5f0a-4fb4-9a55-9736892bb550","rewardName":"Custom: fe5bd765-5f0a-4fb4-9a55-9736892bb550","chromakey":false,"showTimer":false,"obsScene":"","obsSource":"","obsFilter":"Chroma Key","createdAt":"2026-06-13T15:20:39.162Z","positionPreset":"center","videoScale":100,"cooldown":25,"volume":80},{"id":1781364672782,"name":"хаххаха","url":"https://github.com/djesld12q-stack/VideoAlertReward/raw/refs/heads/main/fe774ca7-6ba7-4316-9770-dae3a5832163.mp4","mediaType":"video","duration":3,"rewardId":"8683d105-6ab7-49f2-b504-01c60d35b962","rewardName":"Custom: 8683d105-6ab7-49f2-b504-01c60d35b962","chromakey":true,"showTimer":false,"obsScene":"ВІДЖЕТИ","obsSource":"Нагородитвіч","obsFilter":"Хромакей","createdAt":"2026-06-13T15:31:12.782Z","positionPreset":"center","videoScale":100,"cooldown":5,"volume":40},{"id":1781365592500,"name":"RIP","url":"https://github.com/djesld12q-stack/VideoAlertReward/raw/refs/heads/main/ff863508-a74b-4711-8453-bac58dde76ff.mp4","mediaType":"video","duration":9,"rewardId":"cc4df6bd-dc8f-4c2a-818f-d7eb549c8463","rewardName":"Custom: cc4df6bd-dc8f-4c2a-818f-d7eb549c8463","chromakey":true,"showTimer":false,"obsScene":"ВІДЖЕТИ","obsSource":"Нагородитвіч","obsFilter":"Хромакей","createdAt":"2026-06-13T15:46:32.500Z","positionPreset":"bottom-center","videoScale":60,"cooldown":10,"volume":10},{"id":1781430056112,"name":"Pedro pedro pe","url":"https://github.com/djesld12q-stack/VideoAlertReward/raw/refs/heads/main/fe0f7142-e8d3-47a4-b519-d0b873c042a6.mp4","mediaType":"video","duration":33,"rewardId":"bf468184-9918-41b2-bec9-d10a70e8e784","rewardName":"Custom: bf468184-9918-41b2-bec9-d10a70e8e784","chromakey":true,"showTimer":false,"obsScene":"ВІДЖЕТИ","obsSource":"Нагородитвіч","obsFilter":"ФільтрЧорний","createdAt":"2026-06-14T09:40:56.112Z","positionPreset":"center","videoScale":45,"cooldown":35,"volume":75},{"id":1781430576346,"name":"Так !ТАК!","url":"https://github.com/djesld12q-stack/VideoAlertReward/raw/refs/heads/main/fb5c9a9b-a370-480a-be7a-30c6b0bd896c.mp4","mediaType":"video","duration":8,"rewardId":"49b47081-2778-4dac-a996-9e5bb57b3707","rewardName":"Custom: 49b47081-2778-4dac-a996-9e5bb57b3707","chromakey":true,"showTimer":false,"obsScene":"ВІДЖЕТИ","obsSource":"Нагородитвіч","obsFilter":"Хромакей","createdAt":"2026-06-14T09:49:36.346Z","positionPreset":"center","videoScale":100,"cooldown":10,"volume":50},{"id":1781432891126,"name":"Ui ai ui ai","url":"https://github.com/djesld12q-stack/VideoAlertReward/raw/refs/heads/main/418c8789-141a-4c15-80a6-8bc258c459fc.mp4","mediaType":"video","duration":20,"rewardId":"3b38781f-f4ba-4161-802b-ac18a009a9f6","rewardName":"Custom: 3b38781f-f4ba-4161-802b-ac18a009a9f6","chromakey":true,"showTimer":false,"obsScene":"ВІДЖЕТИ","obsSource":"Нагородитвіч","obsFilter":"Хромакей","createdAt":"2026-06-14T10:28:11.126Z","positionPreset":"bottom-center","videoScale":200,"cooldown":25,"volume":25},{"id":1781504391295,"name":"Повага!","url":"https://github.com/djesld12q-stack/VideoAlertReward/raw/refs/heads/main/c6659010-8ad4-11f0-a950-1def0f91101b.webm","mediaType":"video","duration":5,"rewardId":"5074021a-feb7-40a8-bda8-ec151425d6c9","rewardName":"Custom: 5074021a-feb7-40a8-bda8-ec151425d6c9","chromakey":false,"showTimer":false,"obsScene":"","obsSource":"","obsFilter":"Chroma Key","createdAt":"2026-06-15T06:19:51.295Z","positionPreset":"center","videoScale":100,"cooldown":10,"volume":35},{"id":1781504638737,"name":"оце так поворотище!","url":"https://github.com/djesld12q-stack/VideoAlertReward/raw/refs/heads/main/7e0ce850-736d-11f0-9556-f9caab4856a8.webm","mediaType":"video","duration":5,"rewardId":"aef71f96-9585-4446-9412-739a2fa68d66","rewardName":"Custom: aef71f96-9585-4446-9412-739a2fa68d66","chromakey":false,"showTimer":false,"obsScene":"","obsSource":"","obsFilter":"Chroma Key","createdAt":"2026-06-15T06:23:58.737Z","positionPreset":"center","videoScale":100,"cooldown":10,"volume":60},{"id":1781504843905,"name":"танці","url":"https://github.com/djesld12q-stack/VideoAlertReward/raw/refs/heads/main/12c3f9f0-70aa-11f0-913c-bd1c22829c83.webm","mediaType":"video","duration":10,"rewardId":"87a17f3d-5bd4-4a9c-8eb2-f9de344c6fb7","rewardName":"Custom: 87a17f3d-5bd4-4a9c-8eb2-f9de344c6fb7","chromakey":false,"showTimer":false,"obsScene":"","obsSource":"","obsFilter":"Chroma Key","createdAt":"2026-06-15T06:27:23.905Z","positionPreset":"center","videoScale":100,"cooldown":15,"volume":35},{"id":1781510680580,"name":"Як:?* . я не знаю!","url":"https://github.com/djesld12q-stack/VideoAlertReward/raw/refs/heads/main/8900adb0-1f6f-11f1-8c0f-a3008e14d58c.webm","mediaType":"video","duration":29,"rewardId":"d0dfeccb-4b0f-4e73-945b-4db32053a368","rewardName":"Custom: d0dfeccb-4b0f-4e73-945b-4db32053a368","chromakey":false,"showTimer":false,"obsScene":"","obsSource":"","obsFilter":"Chroma Key","createdAt":"2026-06-15T08:04:40.580Z","positionPreset":"center","videoScale":60,"cooldown":30,"volume":95},{"id":1781513756221,"name":"Закрити гру","url":"https://github.com/djesld12q-stack/VideoAlertReward/raw/refs/heads/main/97910f30-093c-11f1-bd1c-21a8139b72a6.webm","mediaType":"video","duration":13,"rewardId":"e0112660-762f-430f-9d32-7743022ad81e","rewardName":"Custom: e0112660-762f-430f-9d32-7743022ad81e","chromakey":false,"showTimer":false,"obsScene":"","obsSource":"","obsFilter":"Chroma Key","createdAt":"2026-06-15T08:55:56.221Z","positionPreset":"center","videoScale":100,"cooldown":15,"volume":35},{"id":1781617375882,"name":"Не кашляй!","url":"https://github.com/djesld12q-stack/VideoAlertReward/raw/refs/heads/main/e1026510-83c2-11f0-8312-6dc5b7eaf320.webm","mediaType":"video","duration":6,"rewardId":"8aafeeae-d3f6-482d-a5bd-e5f1900da45a","rewardName":"Custom: 8aafeeae-d3f6-482d-a5bd-e5f1900da45a","chromakey":false,"showTimer":false,"obsScene":"","obsSource":"","obsFilter":"Chroma Key","createdAt":"2026-06-16T13:42:55.882Z","positionPreset":"center","videoScale":100,"cooldown":10,"volume":55},{"id":1781627083825,"name":"Diana","url":"https://github.com/djesld12q-stack/VideoAlertReward/raw/refs/heads/main/DianaPragmata.mp4","mediaType":"video","duration":14,"rewardId":"9efd565f-6ca7-47de-95f5-f5bd08ee5f2c","rewardName":"Custom: 9efd565f-6ca7-47de-95f5-f5bd08ee5f2c","chromakey":true,"showTimer":false,"obsScene":"ВІДЖЕТИ","obsSource":"Нагородитвіч","obsFilter":"ФільтрЧорний","createdAt":"2026-06-16T16:24:43.825Z","positionPreset":"bottom-center","videoScale":155,"cooldown":20,"volume":80},{"id":1781683475653,"name":"scary","url":"https://github.com/djesld12q-stack/VideoAlertReward/raw/refs/heads/main/d7654330-2c23-11ef-8b3b-23266ecf296c.webm","mediaType":"video","duration":9,"rewardId":"8639df1e-9804-4096-a796-802be473ae4e","rewardName":"Custom: 8639df1e-9804-4096-a796-802be473ae4e","chromakey":false,"showTimer":false,"positionPreset":"center","videoScale":120,"obsScene":"","obsSource":"","obsFilter":"Chroma Key","createdAt":"2026-06-17T08:04:35.653Z","cooldown":10,"volume":95},{"id":1781683686056,"name":"моє моє !","url":"https://github.com/djesld12q-stack/VideoAlertReward/raw/refs/heads/main/cecd2e50-7370-11f0-b16b-ff23f14c11da.webm","mediaType":"video","duration":7,"rewardId":"afd033a5-6549-4dee-b41d-12570a801b57","rewardName":"Custom: afd033a5-6549-4dee-b41d-12570a801b57","chromakey":false,"showTimer":false,"positionPreset":"center","videoScale":110,"obsScene":"","obsSource":"","obsFilter":"Chroma Key","createdAt":"2026-06-17T08:08:06.056Z","cooldown":10,"volume":50},{"id":1781687959198,"name":"Кинути флешку","url":"https://github.com/djesld12q-stack/VideoAlertReward/raw/refs/heads/main/2c9883b0-6dbb-11f0-9795-d1963f91ed3c.mp4","mediaType":"video","duration":7,"rewardId":"c61e67e5-9bf9-48b8-9f39-86017dd21ac2","rewardName":"Custom: c61e67e5-9bf9-48b8-9f39-86017dd21ac2","chromakey":true,"showTimer":false,"positionPreset":"center","videoScale":155,"obsScene":"ВІДЖЕТИ","obsSource":"Нагородитвіч","obsFilter":"Хромакей","createdAt":"2026-06-17T09:19:19.198Z","cooldown":10},{"id":1781802492829,"name":"ВАЗАП!","url":"https://github.com/djesld12q-stack/VideoAlertReward/raw/refs/heads/main/f5d53a60-30b2-11f1-add7-3fba764bfb66.webm","mediaType":"video","duration":34,"rewardId":"6fafc26e-e5ae-4e49-9266-b5f379b1b006","rewardName":"Custom: 6fafc26e-e5ae-4e49-9266-b5f379b1b006","chromakey":false,"showTimer":false,"positionPreset":"bottom-left","videoScale":65,"cooldown":35,"obsScene":"","obsSource":"","obsFilter":"Chroma Key","createdAt":"2026-06-18T17:08:12.829Z","volume":65},{"id":1781808400605,"name":"Думай!!","url":"https://github.com/djesld12q-stack/VideoAlertReward/raw/refs/heads/main/43ebf241-6925-4ba1-815b-99cb0cadd656.webm","mediaType":"video","duration":10,"rewardId":"636e6050-0c27-49ce-96ed-7cfad9a05926","rewardName":"Custom: 636e6050-0c27-49ce-96ed-7cfad9a05926","chromakey":false,"showTimer":false,"positionPreset":"top-right","videoScale":200,"cooldown":15,"obsScene":"","obsSource":"","obsFilter":"Chroma Key","createdAt":"2026-06-18T18:46:40.605Z","volume":80},{"id":1781866076919.8164,"name":"Привітання","url":"https://github.com/djesld12q-stack/VideoAlertReward/raw/refs/heads/main/e5bbda80-eb75-11f0-b749-b7dfec06dcc5.webm","mediaType":"video","duration":2,"rewardId":"cac18c97-4feb-400e-9555-9dc976c9f03e","commandTrigger":"5d96931c-5d43-417f-b73f-5d2a449816c4","rewardName":"Custom: cac18c97-4feb-400e-9555-9dc976c9f03e","chromakey":true,"showTimer":false,"positionPreset":"bottom-center","videoScale":31,"volume":100,"cooldown":5,"obsScene":"ВІДЖЕТИ","obsSource":"Нагородитвіч","obsFilter":"ФільтрЧорний","createdAt":"2026-06-19T10:47:56.919Z"}]/*END_ALERTS_JSON*/;
+
+// =====================================================================
+// STATE
+// =====================================================================
+let ws            = null;
+let timerInterval = null;
+let hideTimeout   = null;
+let isPlaying     = false;
+let isFading      = false;   // ← захист від подвійного fadeOut
+let configLoaded  = false;
+let isPaused      = false;   // ← пауза алертів (керується з index.html)
+let _canplayFallback = null; // ← глобальний таймер фолбеку для oncanplay
+
+// Кеш алертів: EMBEDDED → перезаписується при ConfigUpdate або з SB globalVar
+let alertsCache = Array.isArray(EMBEDDED_ALERTS) && EMBEDDED_ALERTS.length > 0
+                  ? EMBEDDED_ALERTS
+                  : [];
+
+// Черга алертів
+const alertQueue = [];
+
+// Час останнього спрацювання кожного rewardId (мс, Date.now()) — для cooldown-захисту
+// в tryLocalFallback(), яка інакше повністю ігнорує cooldown (на відміну від C#-сторони).
+const alertLastTriggered = {};
+
+// =====================================================================
+// SB HTTP HELPER
+// =====================================================================
+async function sbAction(actionName, args = {}) {
+    try {
+        const res = await fetch(`${HTTP_URL}/DoAction`, {
+            method:  'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body:    JSON.stringify({ action: { name: actionName, group: '' }, args }),
+            signal:  AbortSignal.timeout(3000)
+        });
+        if (!res.ok) dlog(`⚠️ sbAction "${actionName}" HTTP ${res.status}`);
+        return res.ok;
+    } catch(e) {
+        dlog(`⚠️ sbAction "${actionName}": ${e.message}`);
+        return false;
+    }
+}
+
+// =====================================================================
+// AUTOPLAY UNLOCK — розблокування аудіо при першій взаємодії
+// Браузери блокують аудіо до першого кліку/натискання клавіші.
+// Ми "прогріваємо" AudioContext при першій взаємодії, щоб MP3/WAV грали.
+// =====================================================================
+let _audioUnlocked = false;
+function unlockAudio() {
+    if (_audioUnlocked) return;
+    _audioUnlocked = true;
+    try {
+        const ctx = new (window.AudioContext || window.webkitAudioContext)();
+        const buf = ctx.createBuffer(1, 1, 22050);
+        const src = ctx.createBufferSource();
+        src.buffer = buf;
+        src.connect(ctx.destination);
+        src.start(0);
+        ctx.resume().then(() => {
+            dlog('🔊 Аудіо розблоковано');
+        }).catch(() => {});
+    } catch(_) {}
+
+    // Також "торкаємось" audio елементу
+    const audio = document.getElementById('alertAudio');
+    if (audio) {
+        audio.muted = true;
+        audio.play().catch(() => {});
+        audio.pause();
+        audio.muted = false;
+        audio.src = '';
+    }
+}
+['click','keydown','touchstart','pointerdown'].forEach(ev =>
+    document.addEventListener(ev, unlockAudio, { once: false, capture: true })
+);
+
+// =====================================================================
+// INIT
+// =====================================================================
+window.addEventListener('load', () => {
+    // Виводимо реальний розмір viewport одразу — якщо ≠ 1920×1080, позиції будуть зміщені в OBS
+    dlog(`Viewport: ${window.innerWidth}×${window.innerHeight}`);
+    dlog('Overlay ready');
+    connectWS();
+});
+
+// =====================================================================
+// WEBSOCKET
+// =====================================================================
+function connectWS() {
+    try {
+        ws = new WebSocket(WS_URL);
+
+        ws.onopen = () => {
+            setConn(true, 'Підключено до Streamer.bot');
+            dlog('✓ Connected');
+
+            ws.send(JSON.stringify({
+                request: 'Subscribe',
+                id: 'overlay-sub',
+                events: {
+                    Twitch:  ['ChannelPointsRewardRedemption'],
+                    General: ['Custom']
+                }
+            }));
+
+            // Завантажуємо конфіг і стан паузи з SB globalVar при підключенні
+            loadConfigFromSB();
+            loadPauseStateFromSB();
+        };
+
+        ws.onmessage = (e) => {
+            try { handleMsg(JSON.parse(e.data)); } catch(_) {}
+        };
+
+        ws.onerror   = () => setConn(false, 'WS помилка');
+        ws.onclose   = () => {
+            setConn(false, 'Відключено');
+            dlog(`Reconnect in ${RECONNECT_MS/1000}s...`);
+            setTimeout(connectWS, RECONNECT_MS);
+        };
+
+    } catch(_) {
+        setConn(false, 'Не вдалося підключитись');
+        setTimeout(connectWS, RECONNECT_MS);
+    }
+}
+
+// =====================================================================
+// ОБРОБКА ПОВІДОМЛЕНЬ
+// =====================================================================
+function parseBool(val, defaultVal = false) {
+    if (val === undefined || val === null) return defaultVal;
+    if (typeof val === 'boolean') return val;
+    if (typeof val === 'string') return val.toLowerCase() !== 'false' && val !== '0' && val !== '';
+    return !!val;
+}
+
+// Визначення типу медіа за розширенням (як у index.html getMediaType)
+// Використовується як fallback, якщо mediaType не прийшов разом з алертом.
+function detectMediaType(url) {
+    if (!url) return 'video';
+    const clean = String(url).split('?')[0].split('#')[0];
+    const ext   = clean.split('.').pop().toLowerCase();
+    if (['mp3','wav','ogg','oga','flac','aac','m4a','opus','weba'].includes(ext)) return 'audio';
+    return 'video';
+}
+
+// =====================================================================
+// RESOLVE MEDIA URL
+// GitHub /raw/ посилання роблять HTTP 302 редирект на raw.githubusercontent.com.
+// Браузер у OBS/CEF інколи не слідує редиректу для <audio> — конвертуємо одразу.
+// =====================================================================
+function resolveMediaUrl(url) {
+    if (!url) return url;
+
+    // GitHub: https://github.com/{user}/{repo}/raw/refs/heads/{branch}/{file}
+    //      -> https://raw.githubusercontent.com/{user}/{repo}/refs/heads/{branch}/{file}
+    let m = url.match(/^https?:\/\/github\.com\/([^/]+\/[^/]+)\/raw\/(.+)$/);
+    if (m) {
+        // Нормалізуємо path: кодуємо символи що OBS CEF не любить (, ; ?)
+        const path = m[2].replace(/,/g, '%2C').replace(/;/g, '%3B');
+        const resolved = 'https://raw.githubusercontent.com/' + m[1] + '/' + path;
+        dlog('URL rewrite: github/raw -> raw.githubusercontent: ' + resolved.slice(0, 80));
+        return resolved;
+    }
+
+    // raw.githubusercontent.com — теж нормалізуємо кому
+    if (/raw\.githubusercontent\.com/.test(url)) {
+        const parts = url.split('/');
+        // Кодуємо тільки path частину (після першого /)
+        const origin = parts.slice(0, 3).join('/');
+        const path   = parts.slice(3).map(p => p.replace(/,/g, '%2C').replace(/;/g, '%3B')).join('/');
+        return origin + '/' + path;
+    }
+
+    // Dropbox: dl=0/dl=1 -> raw=1
+    if (/dropbox\.com/.test(url)) {
+        const base = url.replace(/[?&]dl=\d/, '').replace(/[?&]raw=\d/, '');
+        return base + (base.includes('?') ? '&raw=1' : '?raw=1');
+    }
+
+    // Google Drive: /file/d/{id}/view -> /uc?export=download&id={id}
+    m = url.match(/drive\.google\.com\/file\/d\/([^/]+)/);
+    if (m) {
+        return 'https://drive.google.com/uc?export=download&id=' + m[1];
+    }
+
+    return url;
+}
+
+function makeAlertArgs(d) {
+    const videoUrl = d.videoUrl || d.url || '';
+    return {
+        videoUrl,
+        mediaType: d.mediaType || detectMediaType(videoUrl),
+        duration:  d.duration  || 10,
+        name:      d.name      || 'Alert',
+        userName:     d.userName     || '',
+        showNickname: d.showNickname !== undefined ? parseBool(d.showNickname, false) : false,
+        chromakey: parseBool(d.chromakey, false),
+        showTimer: parseBool(d.showTimer, true),
+        positionPreset: d.positionPreset || 'center',
+        videoScale:     parseInt(d.videoScale) || 100,
+        volume:         d.volume !== undefined && d.volume !== null && d.volume !== '' ? Math.max(0, Math.min(100, parseInt(d.volume))) : 100,
+        obsScene:  d.obsScene  || '',
+        obsSource: d.obsSource || '',
+        obsFilter: d.obsFilter || 'Chroma Key'
+    };
+}
+
+function handleMsg(data) {
+    dlog('MSG: ' + JSON.stringify(data).slice(0, 120));
+
+    // ── Живе оновлення конфігу від адмін-панелі (SetVideoAlertConfig → broadcast) ──
+    if (data.action === 'ConfigUpdate') {
+        const newAlerts = data.data?.alerts;
+        if (Array.isArray(newAlerts)) {
+            // Скасовуємо retry — конфіг вже прийшов через WS
+            if (_configRetryTimer) { clearTimeout(_configRetryTimer); _configRetryTimer = null; }
+            alertsCache  = newAlerts;
+            configLoaded = true;
+            setConfigStatus(true, `✓ Конфіг live: ${alertsCache.length} алертів`);
+            dlog(`✓ ConfigUpdate: ${alertsCache.length} алертів`);
+        }
+        return;
+    }
+
+    // ── Пауза алертів (прямий broadcast) ──
+    if (data.action === 'PauseUpdate') {
+        applyPause(!!data.data?.paused);
+        return;
+    }
+
+    // ── Скіп поточного алерту → наступний у черзі (команда !skipReward) ──
+    if (data.action === 'SkipAlert') {
+        skipCurrentAlert();
+        return;
+    }
+
+    // ── Пряме повідомлення action="VideoAlert" (від WebsocketBroadcastJson) ──
+    if (data.action === 'VideoAlert') {
+        const d = data.data || {};
+        if (d.videoUrl) {
+            dlog(`▶ Direct VideoAlert: ${d.name || 'Alert'}`);
+            playAlert(makeAlertArgs(d));
+        }
+        return;
+    }
+
+    // ── Broadcast від Streamer.bot (WebsocketBroadcastJson → General/Custom) ──
+    if (data.event?.source === 'General' && data.event?.type === 'Custom') {
+        let inner = data.data;
+        if (typeof inner === 'string') { try { inner = JSON.parse(inner); } catch(_) {} }
+
+        // ConfigUpdate всередині General/Custom
+        if (inner?.action === 'ConfigUpdate') {
+            const newAlerts = inner.data?.alerts;
+            if (Array.isArray(newAlerts)) {
+                if (_configRetryTimer) { clearTimeout(_configRetryTimer); _configRetryTimer = null; }
+                alertsCache  = newAlerts;
+                configLoaded = true;
+                setConfigStatus(true, `✓ Конфіг live: ${alertsCache.length} алертів`);
+                dlog(`✓ ConfigUpdate (General): ${alertsCache.length} алертів`);
+            }
+            return;
+        }
+
+        // PauseUpdate всередині General/Custom (BroadcastCustomEvent від index.html)
+        if (inner?.action === 'PauseUpdate') {
+            applyPause(!!inner.data?.paused);
+            return;
+        }
+
+        // SkipAlert всередині General/Custom
+        if (inner?.action === 'SkipAlert') {
+            skipCurrentAlert();
+            return;
+        }
+
+        if (inner?.action === 'VideoAlert' && inner?.data?.videoUrl) {
+            dlog(`▶ General/Custom VideoAlert: ${inner.data.name || 'Alert'}`);
+            playAlert(makeAlertArgs(inner.data));
+            return;
+        }
+
+        const raw = inner?.broadcast || inner?.message || inner?.payload;
+        if (raw) {
+            let parsed = raw;
+            if (typeof raw === 'string') { try { parsed = JSON.parse(raw); } catch(_) {} }
+            if (parsed?.action === 'VideoAlert' && parsed?.data?.videoUrl) {
+                dlog(`▶ General/Custom/raw: ${parsed.data.name || 'Alert'}`);
+                playAlert(makeAlertArgs(parsed.data));
+                return;
+            }
+        }
+    }
+
+    // ── WebsocketClient Broadcast ──
+    if (data.event?.type === 'Broadcast' || data.event?.source === 'WebsocketClient') {
+        let inner = data.data;
+        if (typeof inner === 'string') { try { inner = JSON.parse(inner); } catch(_) {} }
+        if (inner?.action === 'PauseUpdate') {
+            applyPause(!!inner.data?.paused);
+            return;
+        }
+        if (inner?.action === 'SkipAlert') {
+            skipCurrentAlert();
+            return;
+        }
+        if (inner?.action === 'VideoAlert' && inner?.data?.videoUrl) {
+            dlog(`▶ WsClient Broadcast: ${inner.data.name || 'Alert'}`);
+            playAlert(makeAlertArgs(inner.data));
+            return;
+        }
+    }
+
+    // ── Channel Point Redemption ──
+    if (data.event?.type === 'ChannelPointsRewardRedemption' ||
+        (data.event?.source === 'Twitch' && data.event?.type === 'ChannelPoints.Redeemed')) {
+        const rd = data.data || {};
+        dlog('🎁 RAW: ' + JSON.stringify(rd).slice(0, 200));
+
+        const rewardId =
+            rd?.reward?.id         ||
+            rd?.rewardId           ||
+            rd?.id                 ||
+            data?.data?.reward?.id ||
+            data?.rewardId         || '';
+
+        const user = rd?.user?.displayName || rd?.userName || rd?.userLogin || '?';
+        dlog(`🎁 rewardId="${rewardId}" user="${user}"`);
+
+        if (rewardId) tryLocalFallback(rewardId);
+        else dlog('⚠️ rewardId НЕ знайдено! Перевір RAW вище.');
+        return;
+    }
+}
+
+// =====================================================================
+// ЗАВАНТАЖЕННЯ КОНФІГУ
+// Пріоритет: 1) SB globalVar (HTTP)  2) EMBEDDED  3) localStorage
+// Якщо globalVar ще не готовий — retry кожні 2с до 30с, потім fallback.
+// =====================================================================
+let _configRetryTimer = null;
+let _configRetryCount = 0;
+const CONFIG_RETRY_INTERVAL = 2000;  // ms між спробами
+const CONFIG_RETRY_MAX      = 15;    // 15 × 2с = 30с максимум
+
+function applyPause(paused) {
+    if (isPaused === paused) return;
+    isPaused = paused;
+    dlog(isPaused ? '⏸️ Алерти призупинено' : '▶ Алерти відновлено');
+    if (!isPaused && !isPlaying && alertQueue.length > 0) {
+        const next = alertQueue.shift();
+        dlog(`▶ Відновлення черги: ${next.name} (ще: ${alertQueue.length})`);
+        _startPlayback(next);
+    }
+}
+
+async function loadPauseStateFromSB() {
+    try {
+        const res = await fetch(`${HTTP_URL}/GetGlobalVar?varName=videoAlertPaused&persisted=true`,
+            { signal: AbortSignal.timeout(3000) });
+        if (!res.ok) {
+            dlog(`⚠️ loadPause HTTP ${res.status} — SB globalVar недоступний`);
+            return;
+        }
+        const json = await res.json();
+        // SB v0.2+ повертає { variable: { value: "..." } }
+        // Старіші / альтернативні формати: json.value, json.data.value
+        const raw = json?.variable?.value
+                 ?? json?.value
+                 ?? json?.Value
+                 ?? json?.data?.value
+                 ?? json?.data?.Value
+                 ?? '';
+        dlog(`📡 Pause SB raw="${raw}" (json.variable=${JSON.stringify(json?.variable)?.slice(0,60)})`);
+        const paused = String(raw).trim().toLowerCase() === 'true';
+        if (paused !== isPaused) {
+            isPaused = paused;
+            dlog(isPaused ? '⏸️ Пауза SYNC з SB → призупинено' : '▶ Пауза SYNC з SB → активні');
+        } else {
+            dlog(`ℹ️ Пауза sync: без змін (isPaused=${isPaused})`);
+        }
+    } catch(e) {
+        dlog(`⚠️ loadPause exception: ${e.message}`);
+    }
+}
+
+async function loadConfigFromSB() {
+    setConfigStatus(false, '⏳ Завантаження конфігу...');
+    _configRetryCount = 0;
+    if (_configRetryTimer) { clearTimeout(_configRetryTimer); _configRetryTimer = null; }
+    await _tryLoadConfig();
+}
+
+async function _tryLoadConfig() {
+    // 1) SB HTTP globalVar
+    try {
+        const res = await fetch(`${HTTP_URL}/GetGlobalVar?varName=videoAlertConfig&persisted=true`,
+            { signal: AbortSignal.timeout(3000) });
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        const json = await res.json();
+        // SB v0.2+ повертає { variable: { value: "..." } }
+        let raw = json?.variable?.value
+               ?? json?.value
+               ?? json?.Value
+               ?? json?.data?.value
+               ?? json?.data?.Value
+               ?? '';
+        if (!raw && typeof json === 'string') raw = json;
+        if (raw) {
+            let parsed;
+            try { parsed = JSON.parse(raw); } catch(_) { parsed = null; }
+            if (Array.isArray(parsed) && parsed.length > 0) {
+                alertsCache  = parsed;
+                configLoaded = true;
+                setConfigStatus(true, `✓ Конфіг з SB: ${alertsCache.length} алертів`);
+                dlog(`✓ Конфіг з SB globalVar: ${alertsCache.length} алертів`);
+                return; // ← успіх, зупиняємо retry
+            }
+        }
+        // globalVar порожній — SB ще не записав конфіг
+        dlog(`⏳ SB globalVar порожній (спроба ${_configRetryCount + 1}/${CONFIG_RETRY_MAX})`);
+    } catch(e) {
+        dlog(`⚠️ SB globalVar HTTP помилка: ${e.message} (спроба ${_configRetryCount + 1}/${CONFIG_RETRY_MAX})`);
+    }
+
+    // Ще є спроби — чекаємо і повторюємо
+    _configRetryCount++;
+    if (_configRetryCount < CONFIG_RETRY_MAX) {
+        const secsLeft = Math.round(((CONFIG_RETRY_MAX - _configRetryCount) * CONFIG_RETRY_INTERVAL) / 1000);
+        setConfigStatus(false, `⏳ Чекаємо SB... (ще ~${secsLeft}с)`);
+        _configRetryTimer = setTimeout(_tryLoadConfig, CONFIG_RETRY_INTERVAL);
+        return;
+    }
+
+    // Вичерпали спроби — fallback
+    dlog('⚠️ SB globalVar не відповів за 30с — використовуємо fallback');
+
+    // 2) Вбудований конфіг
+    if (Array.isArray(EMBEDDED_ALERTS) && EMBEDDED_ALERTS.length > 0) {
+        alertsCache  = EMBEDDED_ALERTS;
+        configLoaded = true;
+        setConfigStatus(true, `✓ Конфіг вбудований: ${alertsCache.length} алертів`);
+        dlog(`✓ Конфіг вбудований (fallback): ${alertsCache.length} алертів`);
+        return;
+    }
+
+    // 3) localStorage (якщо overlay і адмін в одному браузері)
+    try {
+        const parsed = JSON.parse(localStorage.getItem('videoAlerts') || '[]');
+        if (Array.isArray(parsed) && parsed.length > 0) {
+            alertsCache  = parsed;
+            configLoaded = true;
+            setConfigStatus(true, `✓ Конфіг localStorage: ${alertsCache.length} алертів`);
+            dlog(`✓ Конфіг localStorage (fallback): ${alertsCache.length} алертів`);
+            return;
+        }
+    } catch(_) {}
+
+    setConfigStatus(false, '⚠️ Конфіг не знайдено!');
+    dlog('⚠️ Конфіг порожній — збережи алерт в адмін-панелі');
+}
+
+function tryLocalFallback(rewardId) {
+    if (alertsCache.length === 0) {
+        dlog('⚠️ Конфіг порожній');
+        return;
+    }
+
+    dlog(`Пошук "${rewardId}" серед: ${alertsCache.map(a => '"' + a.rewardId + '"').join(', ')}`);
+    const found = alertsCache.find(a => String(a.rewardId).trim() === String(rewardId).trim());
+
+    if (!found) {
+        dlog(`✗ Немає збігу для "${rewardId}"`);
+        dlog('→ Перевір rewardId в адмін-панелі і натисни "Синхронізувати"');
+        return;
+    }
+
+    // ── COOLDOWN ПЕРЕВІРКА ──────────────────────────────────────────────
+    // C# (VideoAlertBroadcast) сам захищений cooldown'ом, але цей шлях
+    // (raw ChannelPointsRewardRedemption напряму в overlay) його ігнорував,
+    // тому той самий redemption міг програтись і тут без жодних обмежень.
+    const cooldownSec = parseInt(found.cooldown) || 0;
+    if (cooldownSec > 0) {
+        const last = alertLastTriggered[rewardId];
+        if (last && (Date.now() - last) / 1000 < cooldownSec) {
+            const remaining = Math.ceil(cooldownSec - (Date.now() - last) / 1000);
+            dlog(`⏳ COOLDOWN (fallback) — "${found.name}" ще ${remaining}с`);
+            return;
+        }
+    }
+    alertLastTriggered[rewardId] = Date.now();
+    // ──────────────────────────────────────────────────────────────────
+
+    dlog(`✓ Match! Граємо: ${found.name}`);
+
+    // ── ХРОМАКЕЙ: в "нормальному" шляху (C#-broadcast) фільтр уже включений
+    // на стороні Streamer.bot ДО broadcast. Цей fallback-шлях той код
+    // повністю обходить, тож якщо хромакей увімкнено в конфізі — вмикаємо
+    // його тут самостійно через ту саму дію ChromaKeyControl.
+    const chromakeyOn = parseBool(found.chromakey, false);
+    if (chromakeyOn && found.obsSource && found.obsFilter) {
+        sbAction('ChromaKeyControl', {
+            action: 'show',
+            obsScene:  found.obsScene  || '',
+            obsSource: found.obsSource || '',
+            obsFilter: found.obsFilter || 'Chroma Key'
+        });
+        dlog(`🟩 ChromaKey SHOW (fallback) → SB: "${found.obsSource}"`);
+    }
+
+    playAlert(makeAlertArgs({ ...found, videoUrl: found.url }));
+}
+
+// =====================================================================
+// ПОЗИЦІЯ ВІДЕО — задає inline style на #videoWrap
+// Використовуємо % замість px — працює при будь-якому розмірі OBS Browser Source.
+// #videoWrap — position:absolute всередині #overlay (position:fixed; inset:0),
+// тобто % рахуються відносно viewport (= реальний розмір Browser Source в OBS).
+// =====================================================================
+function applyPosition(wrap, preset, scalePercent) {
+    // scalePercent: 100 = нормальний розмір, 50 = вдвічі менше, 200 = вдвічі більше
+    const s = Math.max(0.05, Math.min(10, (parseInt(scalePercent) || 100) / 100));
+
+    // Скидаємо всі позиційні стилі
+    wrap.style.top    = '';
+    wrap.style.bottom = '';
+    wrap.style.left   = '';
+    wrap.style.right  = '';
+    wrap.style.width  = '';
+    wrap.style.height = '';
+
+    // Базові розміри: кутові пресети = 50%×50% від viewport, center = 100%×100%.
+    // scale множить ці розміри; позиція залишається прив'язаною до кута/краю.
+    // top-center / bottom-center горизонтально центруються: left = (100 - w) / 2.
+    switch (preset) {
+        case 'top-left': {
+            const w = (50 * s).toFixed(2) + '%';
+            const h = (50 * s).toFixed(2) + '%';
+            wrap.style.top = '0'; wrap.style.left = '0';
+            wrap.style.width = w; wrap.style.height = h;
+            break;
+        }
+        case 'top-center': {
+            const w = (50 * s).toFixed(2) + '%';
+            const h = (50 * s).toFixed(2) + '%';
+            const l = ((100 - 50 * s) / 2).toFixed(2) + '%';
+            wrap.style.top = '0'; wrap.style.left = l;
+            wrap.style.width = w; wrap.style.height = h;
+            break;
+        }
+        case 'top-right': {
+            const w = (50 * s).toFixed(2) + '%';
+            const h = (50 * s).toFixed(2) + '%';
+            wrap.style.top = '0'; wrap.style.right = '0';
+            wrap.style.width = w; wrap.style.height = h;
+            break;
+        }
+        case 'bottom-left': {
+            const w = (50 * s).toFixed(2) + '%';
+            const h = (50 * s).toFixed(2) + '%';
+            wrap.style.bottom = '0'; wrap.style.left = '0';
+            wrap.style.width = w; wrap.style.height = h;
+            break;
+        }
+        case 'bottom-center': {
+            const w = (50 * s).toFixed(2) + '%';
+            const h = (50 * s).toFixed(2) + '%';
+            const l = ((100 - 50 * s) / 2).toFixed(2) + '%';
+            wrap.style.bottom = '0'; wrap.style.left = l;
+            wrap.style.width = w; wrap.style.height = h;
+            break;
+        }
+        case 'bottom-right': {
+            const w = (50 * s).toFixed(2) + '%';
+            const h = (50 * s).toFixed(2) + '%';
+            wrap.style.bottom = '0'; wrap.style.right = '0';
+            wrap.style.width = w; wrap.style.height = h;
+            break;
+        }
+        default: { // center — від центру viewport
+            const w = (100 * s).toFixed(2) + '%';
+            const h = (100 * s).toFixed(2) + '%';
+            const o = ((100 - 100 * s) / 2).toFixed(2) + '%';
+            wrap.style.top = o; wrap.style.left = o;
+            wrap.style.width = w; wrap.style.height = h;
+            break;
+        }
+    }
+}
+
+// =====================================================================
+// ПРОГРАТИ ВІДЕО — з чергою
+// =====================================================================
+function playAlert({ videoUrl, mediaType, duration = 10, name = 'Alert', userName = '', showNickname = false, chromakey = false, showTimer = true, positionPreset = 'center', videoScale = 100, volume = 100, obsScene = '', obsSource = '', obsFilter = 'Chroma Key' }) {
+    if (!mediaType) mediaType = detectMediaType(videoUrl);
+
+    if (isPaused) {
+        alertQueue.push({ videoUrl, mediaType, duration, name, userName, showNickname, chromakey, showTimer, positionPreset, videoScale, volume, obsScene, obsSource, obsFilter });
+        dlog(`⏸️ Пауза — в черзі [${alertQueue.length}]: ${name}`);
+        return;
+    }
+
+    if (isPlaying) {
+        alertQueue.push({ videoUrl, mediaType, duration, name, userName, showNickname, chromakey, showTimer, positionPreset, videoScale, volume, obsScene, obsSource, obsFilter });
+        dlog(`⏳ В черзі [${alertQueue.length}]: ${name}`);
+        return;
+    }
+    _startPlayback({ videoUrl, mediaType, duration, name, userName, showNickname, chromakey, showTimer, positionPreset, videoScale, volume, obsScene, obsSource, obsFilter });
+}
+
+function _startPlayback({ videoUrl, mediaType, duration = 10, name = 'Alert', userName = '', showNickname = false, chromakey = false, showTimer = true, positionPreset = 'center', videoScale = 100, volume = 100, obsScene = '', obsSource = '', obsFilter = 'Chroma Key' }) {
+    if (typeof showTimer === 'string') showTimer = showTimer.toLowerCase() !== 'false';
+    if (typeof chromakey === 'string') chromakey = chromakey.toLowerCase() === 'true';
+    if (!mediaType) mediaType = detectMediaType(videoUrl);
+
+    // Гучність 0-100 → 0.0-1.0, з захистом від некоректних значень
+    let volNum = parseInt(volume);
+    if (isNaN(volNum)) volNum = 100;
+    volNum = Math.max(0, Math.min(100, volNum));
+    const playbackVolume = volNum / 100;
+
+    const video   = document.getElementById('alertVideo');
+    const audio   = document.getElementById('alertAudio');
+    const timerEl = document.getElementById('timer');
+    const wrap    = document.getElementById('videoWrap');
+
+    const isAudio = mediaType === 'audio';
+    const media   = isAudio ? audio : video;
+    const other   = isAudio ? video : audio;
+
+    isPlaying = true;
+
+    // Задаємо позицію через inline style (гарантовано працює в OBS CEF)
+    applyPosition(wrap, positionPreset, videoScale);
+
+    dlog(`▶ Playing: ${name} (${duration}s) [${mediaType}]${chromakey ? ' [🟩хромакей C#]' : ''}${!showTimer ? ' [таймер off]' : ''} [pos:${positionPreset}] [scale:${videoScale}%] [vol:${volNum}%]`);
+    // Детальний лог в файл
+    wlogAlert({ name, videoUrl, duration, chromakey, showTimer, obsScene, obsSource, obsFilter });
+
+    // Прибираємо хендлери з обох елементів і повністю зупиняємо той, що зараз не потрібен
+    video.oncanplay = null; video.onended = null; video.onerror = null;
+    audio.oncanplay = null; audio.onended = null; audio.onerror = null;
+    other.pause();
+    other.src = '';
+
+    wrap.classList.remove('fading', 'visible');
+    timerEl.classList.remove('fading', 'visible');
+
+    // ── ХРОМАКЕЙ: вмикається в _beginShowAndPlay() безпосередньо перед play() ──
+    // (НЕ тут і НЕ в C# — щоб між SHOW і реальним відтворенням не було лагу)
+
+    media.src    = resolveMediaUrl(videoUrl);
+    media.volume = playbackVolume;
+    media.muted  = false;
+
+    let timerStarted = false;
+
+    // Захист від кешованого відео: якщо readyState вже >= 3 (HAVE_FUTURE_DATA),
+    // oncanplay може не спрацювати — запускаємо через requestAnimationFrame
+    const _onReadyToPlay = () => {
+        if (timerStarted) return;
+        timerStarted = true;
+        media.oncanplay = null;
+        _beginShowAndPlay();
+    };
+
+    media.oncanplay = _onReadyToPlay;
+
+    // Фолбек: якщо через 3с oncanplay так і не спрацював — пробуємо грати напряму
+    if (_canplayFallback) clearTimeout(_canplayFallback);
+    _canplayFallback = setTimeout(() => {
+        if (timerStarted) return;
+        dlog(`⚠️ oncanplay не спрацював за 3с — запускаємо напряму (${name})`);
+        _onReadyToPlay();
+    }, 3000);
+
+    function _beginShowAndPlay() {
+        if (_canplayFallback) { clearTimeout(_canplayFallback); _canplayFallback = null; }
+
+        // ── ХРОМАКЕЙ SHOW — безпосередньо перед play(), відео вже завантажено ──
+        // Це гарантує мінімальний gap між фільтром і реальним кадром.
+        if (chromakey && !isAudio && obsSource && obsFilter) {
+            sbAction('ChromaKeyControl', { action: 'show', obsScene, obsSource, obsFilter });
+            dlog(`🟩 ChromaKey SHOW → SB: "${obsSource}" (перед play)`);
+        }
+
+        setTimeout(() => {
+            if (!isAudio) wrap.classList.add('visible');
+            if (showTimer) timerEl.classList.add('visible');
+            // Показуємо ім'я користувача тільки для відео і якщо дозволено
+            if (!isAudio && userName && showNickname) {
+                const unEl = document.getElementById('userName');
+                unEl.textContent = '👤 ' + userName;
+                unEl.style.display = 'block';
+                void unEl.offsetWidth;
+                unEl.classList.add('visible');
+            }
+
+            const tryPlay = () => {
+                media.play().then(() => {
+                    // Якщо аудіо/відео вмикалось muted для розблокування — відновлюємо гучність
+                    if (media.muted) {
+                        media.muted = false;
+                        media.volume = playbackVolume;
+                    }
+                }).catch(err => {
+                    dlog(`⚠️ Play помилка: ${err.name}`);
+                    if (isAudio) {
+                        // Для аудіо: НЕ muted — просто логуємо і завершуємо
+                        dlog('✗ Аудіо заблоковано браузером (потрібна взаємодія)');
+                        wlog({ type: 'error', name: 'audio_blocked', message: 'audio_blocked: ' + name });
+                        _finish({ name, chromakey, obsScene, obsSource, obsFilter, mediaType });
+                    } else {
+                        // Для відео: спробуємо muted як фолбек
+                        media.muted = true;
+                        media.play().catch(() => {
+                            dlog('✗ Play заблоковано навіть muted');
+                            _finish({ name, chromakey, obsScene, obsSource, obsFilter, mediaType });
+                        });
+                    }
+                });
+            };
+            tryPlay();
+
+            let t = duration;
+            updateTimer(t);
+
+            timerInterval = setInterval(() => {
+                t--;
+                updateTimer(t);
+                if (t <= 0) {
+                    clearInterval(timerInterval);
+                    timerInterval = null;
+                    fadeOut({ name, chromakey, obsScene, obsSource, obsFilter, mediaType });
+                }
+            }, 1000);
+
+            hideTimeout = setTimeout(() => fadeOut({ name, chromakey, obsScene, obsSource, obsFilter, mediaType }), (duration + 2) * 1000);
+        }, 0);
+    }
+
+    media.onended = () => {
+        if (timerInterval) {
+            media.currentTime = 0;
+            media.play().catch(() => {});
+        } else {
+            fadeOut({ name, chromakey, obsScene, obsSource, obsFilter, mediaType });
+        }
+    };
+
+    media.onerror = () => {
+        if (_canplayFallback) { clearTimeout(_canplayFallback); _canplayFallback = null; }
+        const ME = media.error;
+        const codeMap = { 1:'ABORTED', 2:'NETWORK', 3:'DECODE', 4:'SRC_NOT_SUPPORTED' };
+        const errCode = ME ? (codeMap[ME.code] || ('code=' + ME.code)) : 'unknown';
+        const errMsg  = ME?.message || '';
+
+        media.oncanplay = null;
+        media.onended   = null;
+        media.onerror   = null;
+        media.src = '';
+        media.load();
+
+        dlog('ERR ' + errCode + (errMsg ? ': ' + errMsg : '') + ' [' + mediaType + '] ' + name);
+        dlog('URL: ' + videoUrl.slice(0, 100));
+        wlog({ type: 'error', name: errCode + ' [' + mediaType + '] ' + name, message: errCode + ' [' + mediaType + '] ' + videoUrl.slice(0, 120) });
+        _finish({ name, chromakey, obsScene, obsSource, obsFilter, mediaType });
+    };
+
+    media.load();
+}
+
+function fadeOut({ name = '', chromakey = false, obsScene = '', obsSource = '', obsFilter = '', mediaType = 'video' } = {}) {
+    // Подвійний захист: якщо вже програємось fadeOut або нічого не грає — виходимо
+    if (!isPlaying || isFading) return;
+    isFading = true;
+
+    const video = document.getElementById('alertVideo');
+    const audio = document.getElementById('alertAudio');
+    const timer = document.getElementById('timer');
+    const media = mediaType === 'audio' ? audio : video;
+
+    // КРИТИЧНО: знімаємо обробники ОДРАЗУ, до setTimeout —
+    // інакше onended може спрацювати під час 450ms fade і викликати fadeOut вдруге
+    media.oncanplay = null;
+    media.onended   = null;
+    media.onerror   = null;
+
+    if (timerInterval) { clearInterval(timerInterval); timerInterval = null; }
+    if (hideTimeout)   { clearTimeout(hideTimeout);    hideTimeout   = null; }
+
+    const wrap = document.getElementById('videoWrap');
+    if (mediaType !== 'audio') wrap.classList.add('fading');
+    timer.classList.add('fading');
+    const unElFade = document.getElementById('userName');
+    unElFade.classList.add('fading');
+
+    setTimeout(() => {
+        if (mediaType !== 'audio') wrap.classList.remove('visible', 'fading');
+        timer.classList.remove('visible', 'fading');
+        const unElHide = document.getElementById('userName');
+        unElHide.classList.remove('visible', 'fading');
+        unElHide.style.display = 'none';
+        unElHide.textContent = '';
+        media.pause();
+        media.src = '';
+        dlog('✓ Hidden');
+        _finish({ name, chromakey, obsScene, obsSource, obsFilter });
+    }, 450);
+}
+
+function _finish({ name = '', chromakey = false, obsScene = '', obsSource = '', obsFilter = '' } = {}) {
+    if (timerInterval) { clearInterval(timerInterval); timerInterval = null; }
+    if (hideTimeout)   { clearTimeout(hideTimeout);    hideTimeout   = null; }
+    isPlaying = false;
+    isFading  = false;   // ← скидаємо прапор, щоб наступний алерт міг нормально завершитись
+
+    wlogEnd(name);
+
+    // ── ХРОМАКЕЙ HIDE — синхронізований з наступним алертом у черзі ──
+    if (chromakey && obsSource) {
+        const next = alertQueue[0];
+        const nextNeedsChroma = next && next.chromakey &&
+            (next.obsSource || '') === obsSource &&
+            (next.obsFilter || '') === obsFilter;
+
+        if (nextNeedsChroma) {
+            // Наступний алерт на тому самому джерелі з тим самим фільтром —
+            // НЕ вимикаємо хромакей взагалі: overlay сам увімкне його перед play()
+            // (фільтр вже увімкнений, тримаємо так)
+            dlog(`🟩 ChromaKey KEEP (наступний "${next.name}" теж хромакей на "${obsSource}")`);
+        } else {
+            // Наступного хромакей-алерту нема або він на іншому джерелі — вимикаємо зразу
+            dlog(`🟩 ChromaKey HIDE → SB: "${obsSource}"`);
+            sbAction('ChromaKeyControl', { action: 'hide', obsScene, obsSource, obsFilter });
+        }
+    }
+
+    if (alertQueue.length > 0) {
+        const next = alertQueue.shift();
+        dlog(`▶ Черга: ${next.name} (ще: ${alertQueue.length})`);
+        _startPlayback(next);
+    } else {
+        dlog('✓ Черга порожня');
+    }
+}
+
+// =====================================================================
+// SKIP CURRENT ALERT — скіпає поточний і запускає наступний у черзі
+// Викликається командою !skipReward (SkipReward Action у Streamer.bot)
+// =====================================================================
+function skipCurrentAlert() {
+    if (!isPlaying && alertQueue.length === 0) {
+        dlog('⏭ Skip: нічого не грає');
+        return;
+    }
+
+    dlog('⏭ SkipAlert: пропускаємо поточний...');
+
+    if (timerInterval)    { clearInterval(timerInterval);  timerInterval    = null; }
+    if (hideTimeout)      { clearTimeout(hideTimeout);     hideTimeout      = null; }
+    if (_canplayFallback) { clearTimeout(_canplayFallback); _canplayFallback = null; }
+
+    const video = document.getElementById('alertVideo');
+    const audio = document.getElementById('alertAudio');
+    const timer = document.getElementById('timer');
+    const wrap  = document.getElementById('videoWrap');
+
+    // Знімаємо обробники щоб старий onended/onerror не спрацював під час fade
+    [video, audio].forEach(m => {
+        m.oncanplay = null;
+        m.onended   = null;
+        m.onerror   = null;
+        m.pause();
+        m.src = '';
+    });
+
+    // Плавне зникнення
+    wrap.classList.add('fading');
+    timer.classList.add('fading');
+    const unEl = document.getElementById('userName');
+    if (unEl) unEl.classList.add('fading');
+
+    setTimeout(() => {
+        wrap.classList.remove('visible', 'fading');
+        timer.classList.remove('visible', 'fading');
+        if (unEl) { unEl.classList.remove('visible', 'fading'); unEl.style.display = 'none'; unEl.textContent = ''; }
+
+        isPlaying = false;
+        isFading  = false;
+
+        dlog(`⏭ Скіп завершено. Черга: ${alertQueue.length}`);
+
+        if (alertQueue.length > 0) {
+            const next = alertQueue.shift();
+            dlog(`▶ Наступний після скіпу: ${next.name} (ще: ${alertQueue.length})`);
+            _startPlayback(next);
+        } else {
+            dlog('✓ Черга порожня після скіпу');
+        }
+    }, 450);
+}
+
+function stopCurrent() {
+    if (timerInterval) { clearInterval(timerInterval); timerInterval = null; }
+    if (hideTimeout)   { clearTimeout(hideTimeout);    hideTimeout   = null; }
+    if (_canplayFallback) { clearTimeout(_canplayFallback); _canplayFallback = null; }
+
+    const video = document.getElementById('alertVideo');
+    const audio = document.getElementById('alertAudio');
+    const timer = document.getElementById('timer');
+    const wrap  = document.getElementById('videoWrap');
+
+    [video, audio].forEach(m => {
+        m.oncanplay = null;
+        m.onended   = null;
+        m.onerror   = null;
+        m.pause();
+        m.src = '';
+    });
+
+    wrap.classList.remove('visible', 'fading');
+    timer.classList.remove('visible', 'fading');
+    const unElStop = document.getElementById('userName');
+    if (unElStop) { unElStop.classList.remove('visible','fading'); unElStop.style.display='none'; unElStop.textContent=''; }
+    isPlaying = false;
+    isFading  = false;
+
+    if (alertQueue.length > 0) {
+        dlog(`⛔ Черга очищена (${alertQueue.length} скасовано)`);
+        alertQueue.length = 0;
+    }
+}
+
+function updateTimer(s) {
+    document.getElementById('timer').textContent = Math.max(0, s);
+}
+
+// =====================================================================
+// DEBUG
+// =====================================================================
+function dlog(msg) {
+    const log  = document.getElementById('log');
+    const time = new Date().toLocaleTimeString('uk', { hour12: false });
+    const d    = document.createElement('div');
+    d.textContent = `[${time}] ${msg}`;
+    log.insertBefore(d, log.firstChild);
+    while (log.children.length > 18) log.removeChild(log.lastChild);
+    // файловий лог НЕ тут — тільки через wlogAlert/wlogEnd/wlogChromakey/wlogQueue
+}
+
+// Лог старту алерту з повними деталями
+function wlogAlert(alertData) {
+    wlog({
+        type:      'alert_start',
+        name:      alertData.name      || '',
+        rewardId:  alertData.rewardId  || '',
+        videoUrl:  alertData.videoUrl  || '',
+        duration:  String(alertData.duration  ?? 10),
+        chromakey: String(alertData.chromakey ?? false),
+        showTimer: String(alertData.showTimer ?? true),
+        obsScene:  alertData.obsScene  || '',
+        obsSource: alertData.obsSource || '',
+        obsFilter: alertData.obsFilter || ''
+    });
+}
+
+function wlogEnd(name) {
+    wlog({ type: 'alert_end', name });
+}
+
+function wlogQueue(name, count) {
+    wlog({ type: 'alert_queue', name, count: String(count) });
+}
+
+function wlogChromakey(action, obsSource, obsFilter) {
+    wlog({ type: 'chromakey', action, obsSource, obsFilter });
+}
+
+function wlog(fields = {}) {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    try {
+        ws.send(JSON.stringify({
+            request: 'DoAction',
+            id:      'wlog',
+            action:  { name: 'WriteLog', group: '' },
+            args:    { source: 'OVERLAY', ...fields }
+        }));
+    } catch(_) {}
+}
+
+function setConn(ok, text) {
+    document.getElementById('dot').className        = 'dot' + (ok ? ' on' : '');
+    document.getElementById('connText').textContent = text;
+
+    const dbg = document.getElementById('debug');
+    if (ok) {
+        dbg.classList.remove('hiding', 'hidden');
+        clearTimeout(window._debugHideTimer);
+        window._debugHideTimer = setTimeout(() => {
+            dbg.classList.add('hiding');
+            setTimeout(() => dbg.classList.add('hidden'), 1000);
+        }, 5000);
+    } else {
+        clearTimeout(window._debugHideTimer);
+        dbg.classList.remove('hiding', 'hidden');
+    }
+}
+
+function setConfigStatus(ok, text) {
+    const dot  = document.getElementById('configDot');
+    const span = document.getElementById('configText');
+    if (dot)  dot.style.cssText  = ok ? 'background:#6af;animation:none' : 'background:#fa0;animation:blink 1s infinite';
+    if (span) span.textContent   = text;
+}
+
+// =====================================================================
+// CONSOLE API (DevTools)
+// =====================================================================
+window.testAlert  = (url, duration = 10, mediaType) => playAlert({ videoUrl: url, duration, mediaType });
+window.stopAlert  = () => stopCurrent();
+window.showQueue  = () => { dlog(`Черга (${alertQueue.length}): ${alertQueue.map(a => a.name).join(', ') || '—'}`); };
+window.showConfig = () => { dlog(`Конфіг (${alertsCache.length}): ${alertsCache.map(a => a.name).join(', ') || '—'}`); };
+
+// Тест першого алерту з кешу (кнопка ▶ в debug)
+function runLocalTest() {
+    if (alertsCache.length === 0) {
+        dlog('⚠️ Кеш порожній. Збережи алерт в адмін-панелі і натисни "Синхронізувати".');
+        return;
+    }
+    const a = alertsCache[0];
+    dlog(`▶ Тест: ${a.name}`);
+    playAlert(makeAlertArgs({ ...a, videoUrl: a.url }));
+}
+</script>
+</body>
+</html>
